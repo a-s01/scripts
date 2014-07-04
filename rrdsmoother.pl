@@ -8,7 +8,7 @@
 #
 #  DESCRIPTION: 
 #   Script removes peaks on rrd graphs between specified time diapason. If some value on this diapason is 
-#   significantly different (or in "scale" times different if scale's set) from previous and following 
+#   significantly different (or in \"scale\" times different if scale's set) from previous and following 
 #   values it's our peak and it'll be smoothered. By default scale is 10 and more.
 #   Peak span is a count of value measurements peak was present. Default is equal to 1.
 #   Date can be exact and can be diapason. If it's diapason then time is ignored. You can specify a standart 
@@ -28,7 +28,8 @@
 #       -t 12:15 13:00        
 #   
 #   !!! To avoid confusions put -- after options list or place file/directory name first in line. !!!
-#   
+#
+#   If you want to fix peak on the end of database, where peak span can be less then defined, use 'fix-end' option.
 #   If you cannot understand why script doesn't find a peak while it's exactly present in defined time diapason,
 #   you can use --analysis option. Maybe you may wide the peak span or reduce scale value.
 #
@@ -54,6 +55,7 @@ use constant rrdInterval => 5; #in minutes
 use constant rrdFileMark => qr/RRDTool DB/i;
 use constant rrdtool => "rrdtool";
 my $DEBUG;
+my $STANDART_DIAPASON;
 
 sub assert {
     my ($one,$two,$line) = @_;
@@ -63,6 +65,7 @@ sub assert {
 sub checkDateFormat {
     my ($date) = @_;
     # CODE {{{1
+    $date =~ s/^~//;
     my @strDate = ("today", "yesterday");
     return 1 if (grep {$_ eq $date} @strDate);
     
@@ -100,7 +103,7 @@ sub parseDate {
     if ($dateStr eq 'today' or $dateStr eq 'yesterday') {
         $dateObj = DateTime->today();
         if ($dateStr eq 'yesterday') {
-            $dateObj = $dateObj->substract(days => 1);
+            $dateObj = $dateObj->subtract(days => 1);
         }
     } else {
         my ($year,$month,$date) = split(/-/,$dateStr);
@@ -112,6 +115,7 @@ sub parseDate {
         $dateObj->set_hour($h); 
         $dateObj->set_minute($m);
     }
+    print "DE: date is " . $dateObj->strftime("%Y-%m-%d"). "\n" if ($DEBUG);
     # 1}}}
     return ($dateObj);
 }
@@ -122,11 +126,13 @@ sub getDateDiapason {
     my @diapason;
     $firstDate = parseDate($firstDate);
     if ($lastDate) {
-        $lastDate = parseDate($lastDate);        
-    } else {
+        $lastDate = parseDate($lastDate);
+    } elsif ($STANDART_DIAPASON) {
         my $dateSpan = DateTime::Duration->new(days => 5);
         $lastDate = $firstDate + $dateSpan;
         $firstDate = $firstDate - $dateSpan;
+    } else {
+        $lastDate = $firstDate;
     }
     
     my $dateSpan = DateTime::Duration->new(days => 1);
@@ -135,7 +141,8 @@ sub getDateDiapason {
         $firstDate += $dateSpan;
     }
     push (@diapason, $lastDate->strftime("%Y-%m-%d"));
-    
+    $, = " - ";
+    print "DE: date diapason = @diapason\n" if ($DEBUG);
      # 1}}} 
     return (\@diapason);
 }
@@ -189,7 +196,7 @@ sub searchInDiapason {
 }
 
 sub smoother {
-    my ($fileContent,$searchDiapason,$scale,$peakSpan,$ANALYSIS) = @_;
+    my ($fileContent,$searchDiapason,$scale,$peakSpan,$ANALYSIS,$fix_end) = @_;
     #CODE {{{1 
     my (@lastDs,%suspiciousData,$spanCount,$suspiciousMark,$rraType,@analysisInfo,$newRRAmark);
 
@@ -246,6 +253,21 @@ sub smoother {
             @lastDs = @ds;
         };
     
+        my $fix = sub {
+           my @ds = @_;
+
+           $analysisInfo->("fixed.");
+
+           my $newStr = " <row>";
+           for (my $j = 0; $j <= $#lastDs; $j++) {
+               $newStr .= "<v> " . ($lastDs[$j] + $ds[$j])/2 . " </v>";
+           }
+           $newStr .= "</row>";
+
+           for my $line (keys %suspiciousData) {
+               $fileContent->[$line] = "<!-- $suspiciousData{$line}{time} -->" . $newStr;
+           }
+        };
 
         if ($suspiciousMark) {
             $spanCount++;
@@ -270,7 +292,18 @@ sub smoother {
             if ($suspiciousMark) {
 
                 if ($peakSpan < $spanCount) {
-                    $analysisInfo->("seems like normal smooth change. Suspect \"peak\" takes minumum $spanCount measurements");
+                    if ($fileContent->[$i+1] =~ /<\/database>/) {
+                        if ($ANALYSIS) {
+                            $analysisInfo->("It can be a peak on the end of database, although peak span is $spanCount (<$peakSpan).");
+                        } else {                            
+                            $analysisInfo->("It can be a peak on the end of database, peak span is $spanCount (<$peakSpan). (If you want to fix it use 'fix-end' option.)");
+                            if ($fix_end) {
+                                $fix->(@ds);     
+                            }
+                        }
+                    } else {
+                        $analysisInfo->("seems like normal smooth change. Suspect \"peak\" takes minumum $spanCount measurements");
+                    }
                     $zeroing->();
                 } else {
                     print "\nDE: continue watching, it steal can be a peak\n" if ($DEBUG);
@@ -283,18 +316,7 @@ sub smoother {
                         $zeroing->();
                         next;
                     }
-
-                    $analysisInfo->("fixed.");
-
-                    my $newStr = " <row>";
-                    for (my $j = 0; $j <= $#lastDs; $j++) {
-                        $newStr .= "<v> " . ($lastDs[$j] + $ds[$j])/2 . " </v>";
-                    }
-                    $newStr .= "</row>";
-
-                    for my $line (keys %suspiciousData) {
-                        $fileContent->[$line] = "<!-- $suspiciousData{$line}{time} -->" . $newStr;
-                    }
+                    $fix->(@ds);
 
                     $zeroing->();
                 } else {
@@ -321,11 +343,25 @@ sub smoother {
                     $thisScale = $ds[$j];
                 }
                 if ($thisScale >= $scale) {
-#                    print "DE: $j: scale = $thisScale\n";
                     $suspiciousData{$i}= {ds => \@ds, time => $time};
-                    $suspiciousMark = 1;                        
-                    $spanCount = 1;
-                    last;
+
+                    if ($fileContent->[$i+1] =~ /<\/database>/) {
+#                        print $_ if ($DEBUG);
+		                    if ($ANALYSIS) {
+		                        $analysisInfo->("It can be a peak on the end of database, peak span is 1.");
+		                    } else {
+                                $analysisInfo->("It can be a peak on the end of database, peak span is 1 (<=$peakSpan) (if you want to fix it use 'fix-end' option).");
+                                if ($fix_end) {
+                                    $fix->(map {0} @ds);     
+                                }
+		                    }
+                            $zeroing->();
+                    } else {
+#                    print "DE: $j: scale = $thisScale\n";
+                        $suspiciousMark = 1;                        
+                        $spanCount = 1;
+                        last;
+                    }
                 }
             }
             unless ($suspiciousMark) {
@@ -337,7 +373,7 @@ sub smoother {
     return ($fileContent,\@analysisInfo);        
 }
 
-my $usage="Usage: $0 [-d date -t time -s scale -ts peak_span --debug --analysis --] rrd_file/directory\nDate format yyyy-mm-dd, time format hh:mm\n";
+my $usage="Usage: $0 [-d date -t time -s scale -ts peak_span --debug --analysis --fix-end --] rrd_file/directory\nDate format yyyy-mm-dd, time format hh:mm\n";
 my $help=<<END;
 $usage
 Script removes peaks on rrd graphs between specified time diapason. If some value on this diapason is significantly different (or in \"scale\" times different if scale's set) from previous and following values it's our peak and it'll be smoothered.
@@ -359,12 +395,14 @@ Examples:
 
 To avoid confusions put -- after options list or place file/directory name first in line.
 
+If you want to fix peak on the end of database, where peak span can be less then defined, use 'fix-end' option.
+
 If you cannot understand why script doesn't find a peak while it's exactly present in defined time diapason, you can use --analysis option. Maybe you may wide the peak span.
 END
 
 die $usage unless @ARGV;
 
-my (@dateDiapason,@time,$scale,$help_mark,$peakSpan,@files,$analysis);
+my (@dateDiapason,@time,$scale,$help_mark,$peakSpan,@files,$analysis,$fix_end);
 
 GetOptions( "help|h|?" => sub { print $help; exit 0;},
             "d=s{1,2}" => \@dateDiapason, 
@@ -372,6 +410,7 @@ GetOptions( "help|h|?" => sub { print $help; exit 0;},
             "ts=s" => \$peakSpan,
             "s=i" => \$scale,
             "analysis" => \$analysis,
+            "fix-end|e" => \$fix_end,
             "debug" => \$DEBUG); 
 
 die $usage unless (@ARGV);
@@ -425,6 +464,9 @@ my $searchDiapason;
 if (@dateDiapason == 2) {
     $searchDiapason = getSearchDiapason(\@dateDiapason,\@time);
 } else {
+    if ($dateDiapason[0] =~ s/^~//) {
+        $STANDART_DIAPASON = 1;
+    }
     $searchDiapason = getSearchDiapason($dateDiapason[0],\@time);
 }
 
@@ -444,7 +486,7 @@ FILE: for my $file (@files) {
             next;
         }
         chomp(my @xmlContent = <XML>);
-        my ($newXmlContent,$analysisInfo) = smoother(\@xmlContent, $searchDiapason, $scale, $peakSpan, $analysis);    
+        my ($newXmlContent,$analysisInfo) = smoother(\@xmlContent, $searchDiapason, $scale, $peakSpan, $analysis,$fix_end);    
         
         $,="\n";
         if ($analysis) {
