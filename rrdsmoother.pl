@@ -28,8 +28,7 @@
 #       -t 12:15 13:00        
 #   
 #   !!! To avoid confusions put -- after options list or place file/directory name first in line. !!!
-#
-#   If you want to fix peak on the end of database, where peak span can be less then defined, use 'fix-end' option.
+#   
 #   If you cannot understand why script doesn't find a peak while it's exactly present in defined time diapason,
 #   you can use --analysis option. Maybe you may wide the peak span or reduce scale value.
 #
@@ -49,13 +48,13 @@ use warnings;
 use DateTime;
 use DateTime::Duration;
 use Getopt::Long;
-#use Data::Dumper;
+use Data::Dumper;
 
 use constant rrdInterval => 5; #in minutes
 use constant rrdFileMark => qr/RRDTool DB/i;
 use constant rrdtool => "rrdtool";
 my $DEBUG;
-my $STANDART_DIAPASON;
+my $STANDART_DIAPASON = 1;
 
 sub assert {
     my ($one,$two,$line) = @_;
@@ -128,9 +127,9 @@ sub getDateDiapason {
     if ($lastDate) {
         $lastDate = parseDate($lastDate);
     } elsif ($STANDART_DIAPASON) {
-        my $dateSpan = DateTime::Duration->new(days => 5);
+        my $dateSpan = DateTime::Duration->new(days => $STANDART_DIAPASON);
         $lastDate = $firstDate + $dateSpan;
-        $firstDate = $firstDate - $dateSpan;
+#        $firstDate = $firstDate - $dateSpan;
     } else {
         $lastDate = $firstDate;
     }
@@ -142,14 +141,14 @@ sub getDateDiapason {
     }
     push (@diapason, $lastDate->strftime("%Y-%m-%d"));
     $, = " - ";
-    print "DE: date diapason = @diapason\n" if ($DEBUG);
+    print "INFO: search diapasons are @diapason\n";
      # 1}}} 
     return (\@diapason);
 }
 
 sub getTimeDiapason {
     my ($date,$begin,$end) = @_;
-    #  CODE{{{1
+    #  CODE{{{1 
     my @diapason;
     $begin = parseDate($date,$begin);
 
@@ -228,7 +227,9 @@ sub smoother {
         push(@analysisInfo, $infoStr);
     };
 
+    my $DEBUG_INFO;
     for (my $i = 0; $i <= $#{$fileContent}; $i++) {
+        #print "DEBUG: i = $i\n" if ($DEBUG);
         my $_ = $fileContent->[$i];
 
         if (/<cf>(.*)<\/cf>/) {
@@ -237,10 +238,9 @@ sub smoother {
             $rraType .= $1;
             $newRRAmark = 1;
 
+            print "\nDEBUG: $rraType\n" if ($DEBUG);
             next;
         }
-
-        next unless (searchInDiapason($_,$searchDiapason));
 
         my ($time,@ds);
 
@@ -251,7 +251,10 @@ sub smoother {
             $spanCount = $suspiciousMark = 0;
             %suspiciousData = ();
             @lastDs = @ds;
+            $DEBUG_INFO = '';
         };
+
+        #print "DEBUG: \$_ = $_\n" if ($DEBUG);
     
         my $fix = sub {
            my @ds = @_;
@@ -260,27 +263,39 @@ sub smoother {
 
            my $newStr = " <row>";
            for (my $j = 0; $j <= $#lastDs; $j++) {
-               $newStr .= "<v> " . ($lastDs[$j] + $ds[$j])/2 . " </v>";
+               $newStr .= "<v>$lastDs[$j]</v>";
            }
            $newStr .= "</row>";
 
            for my $line (keys %suspiciousData) {
                $fileContent->[$line] = "<!-- $suspiciousData{$line}{time} -->" . $newStr;
            }
+
+           my $k = $i + 1;
+           $DEBUG_INFO .= "DEBUG: next line $k will be $fileContent->[$k]\n";
+           print "$DEBUG_INFO\n" if ($DEBUG);           
         };
 
+        # we don't check time here for including values on the edge on time diapasone
         if ($suspiciousMark) {
+            print Data::Dumper->Dump([\%suspiciousData], ['suspiciousData']) if ($DEBUG and $DEBUG == 2);
+            $DEBUG_INFO .= Data::Dumper->Dump([\%suspiciousData], ['suspiciousData']);
             $spanCount++;
+            
+            print "DEBUG: next line $i is @ds\n" if ($DEBUG and $DEBUG == 2);
+            $DEBUG_INFO .= "DEBUG: next line $i is @ds\n";
 
             for (my $j = 0; $j <= $#{$suspiciousData{$i-1}{ds}}; $j++) {
                 my $thisScale;
 
-                if ($ds[$j] != 0 and $ds[$j] ne 'NaN') {
+                if ($ds[$j] and $ds[$j] ne 'NaN' and $ds[$j] >= 1) {
                     $thisScale = $suspiciousData{$i-1}{ds}[$j]/$ds[$j];
                 } else {
                     $thisScale = $suspiciousData{$i-1}{ds}[$j];
                 }
 
+                print "DEBUG: lets canculate scale $time thisScale == $thisScale\n" if ($DEBUG and $DEBUG == 2);
+                $DEBUG_INFO .= "DEBUG: lets canculate scale $time thisScale == $thisScale\n";
                 if ($thisScale >= $scale) {
                     $spanCount--;
                     $suspiciousMark = 0;
@@ -306,13 +321,19 @@ sub smoother {
                     }
                     $zeroing->();
                 } else {
-                    print "\nDE: continue watching, it steal can be a peak\n" if ($DEBUG);
+                    print "\nDEBUG: continue watching, it steal can be a peak\n" if ($DEBUG and $DEBUG == 2);
+                    $DEBUG_INFO .= "\nDEBUG: continue watching, it steal can be a peak\n";
                     $suspiciousData{$i} = {ds => \@ds, time => $time};
                 }
             } else {
                 if ($peakSpan == $spanCount) {
+                    print "DEBUG: peakSpan ($peakSpan) == spanCount ($spanCount), it's fix case\n" if ($DEBUG and $DEBUG == 2);
+                    $DEBUG_INFO .= "DEBUG: peakSpan ($peakSpan) == spanCount ($spanCount), it's fix case\n";
                     if ($ANALYSIS) {
                         $analysisInfo->("I think it's a peak. It takes exactly $spanCount measurements.");
+                        my $k = $i+1;
+                        $DEBUG_INFO .= "DEBUG: next line $k will be $fileContent->[$k]\n";
+                        print $DEBUG_INFO if ($DEBUG);
                         $zeroing->();
                         next;
                     }
@@ -320,29 +341,38 @@ sub smoother {
 
                     $zeroing->();
                 } else {
+                    print "DEBUG: peakSpan ($peakSpan) != spanCount ($spanCount), it's NOT a fix case\n" if ($DEBUG and $DEBUG == 2);
+                    $DEBUG_INFO .= "DEBUG: peakSpan ($peakSpan) != spanCount ($spanCount), it's NOT a fix case\n";
                     $analysisInfo->("I think it's not a peak. Posistive measurements count ($spanCount) isn't equal to defined peak span ($peakSpan)");
 
                     $zeroing->();
                 }
             }
         } else {
+            unless (searchInDiapason($_,$searchDiapason)) {
+                $zeroing->();
+                next;
+            }
             unless (@lastDs) { # we must check first value in file if it satisfies the time condition
                 @lastDs = @ds;
-                if (map { $_ ne 'NaN' or $_ > 0 } @ds) { # line with only null is not suspicious
+                if (map { $_ ne 'NaN' or $_ > 1 } @ds) { # line with only null is not suspicious
                     $suspiciousData{$i}= {ds => \@ds, time => $time};                
                     $suspiciousMark = 1;
                     $spanCount = 1;
                 }
                 next;
             }
+
             for (my $j=0; $j <= $#ds; $j++) {
                 my $thisScale;
-                if ($lastDs[$j] !=0 and $lastDs[$j] ne 'NaN') {
+                if ($lastDs[$j] >= 1 and $lastDs[$j] ne 'NaN') {
                     $thisScale = $ds[$j]/$lastDs[$j];
                 } else {
                     $thisScale = $ds[$j];
                 }
                 if ($thisScale >= $scale) {
+                    print "DEBUG: $time thisScale == $thisScale >= $scale\n" if ($DEBUG and $DEBUG == 2);
+                    $DEBUG_INFO .= "DEBUG: $time thisScale == $thisScale >= $scale\n";
                     $suspiciousData{$i}= {ds => \@ds, time => $time};
 
                     if ($fileContent->[$i+1] =~ /<\/database>/) {
@@ -357,6 +387,8 @@ sub smoother {
 		                    }
                             $zeroing->();
                     } else {
+                        print "DEBUG: it's not the end of database, so looks suspicious to me.\n" if ($DEBUG and $DEBUG == 2);
+                        $DEBUG_INFO .= "DEBUG: it's not the end of database, so looks suspicious to me.\n";
 #                    print "DE: $j: scale = $thisScale\n";
                         $suspiciousMark = 1;                        
                         $spanCount = 1;
@@ -373,19 +405,23 @@ sub smoother {
     return ($fileContent,\@analysisInfo);        
 }
 
-my $usage="Usage: $0 [-d date -t time -s scale -ts peak_span --debug --analysis --fix-end --] rrd_file/directory\nDate format yyyy-mm-dd, time format hh:mm\n";
+my $scale = 3;
+my $peakSpan = 1;
+
+my $usage="Usage: $0 [-d date -t time -s scale -ts peak_span --debug --ddebug --analysis --fix-end --no-skip-hidden --] rrd_file/directory\nDate format yyyy-mm-dd, time format hh:mm\n";
 my $help=<<END;
 $usage
 Script removes peaks on rrd graphs between specified time diapason. If some value on this diapason is significantly different (or in \"scale\" times different if scale's set) from previous and following values it's our peak and it'll be smoothered.
-By default scale is 10 and more.
-Peak span is a count of value measurements peak was present. Default is equal to 1.
-Date can be exact and can be diapason. If it's diapason then time is ignored. You can specify a standart diapason (5 days before, 5 days after) by putting '~' before exact date.
+Hidden files are skipped by default. You can add "no-skip-hidden" to avoid default behaviour.
+By default scale is $scale and more.
+Peak span is a count of value measurements peak was present. Default is equal to $peakSpan.
+Date can be exact and can be diapason. If it's diapason then time is ignored. By default if you specify a date than it will be a standart diapason ($STANDART_DIAPASON days before, $STANDART_DIAPASON days after). It's needed for correct fix MAX, AVERAGE diapasons. You can specify exact day by putting '~' before your date.
 
 Examples meaning the same date diapason:  
-    -d 2013-11-01 2013-11-10
-    -d ~2013-11-05
+    -d 2013-11-01 2013-11-03
+    -d 2013-11-02
 Example of exact date: 
-    -d 2013-11-05
+    -d ~2013-11-02
 
 Time is always a diapason. If you specify a exact time without ~ it'll be standart diapason 15m before and after this time.
 
@@ -402,7 +438,7 @@ END
 
 die $usage unless @ARGV;
 
-my (@dateDiapason,@time,$scale,$help_mark,$peakSpan,@files,$analysis,$fix_end);
+my (@dateDiapason,@time,$help_mark,@files,$analysis,$fix_end,$skipHiddenFiles);
 
 GetOptions( "help|h|?" => sub { print $help; exit 0;},
             "d=s{1,2}" => \@dateDiapason, 
@@ -411,13 +447,12 @@ GetOptions( "help|h|?" => sub { print $help; exit 0;},
             "s=i" => \$scale,
             "analysis" => \$analysis,
             "fix-end|e" => \$fix_end,
-            "debug" => \$DEBUG); 
+            "debug" => \$DEBUG, 
+            "ddebug" => sub { $DEBUG = 2; },
+            "no-skip-hidden" => \$skipHiddenFiles,
+); 
 
 die $usage unless (@ARGV);
-
-$scale ||= 10;
-$peakSpan ||= 1;
-
 
 unless (@dateDiapason) {
     print "Date of the peak: ";
@@ -443,7 +478,15 @@ if ($time[0]) {
     }
 }
 
-for my $file (@ARGV) {
+#lets get all rrd files, they can be in directories
+while (@ARGV) {
+    my $file = pop @ARGV;
+
+    # skip hidden files and dirs by default
+    if (! $skipHiddenFiles and ($file =~ /^\.[^\/]/ or $file =~ /\/\.([^\/]+)$/)) {
+        next;
+    }
+
     if (-d $file) {
         opendir(D,$file) or warn "Cannot open $file: $!\n";
         while (my $inDir = readdir(D)) {
@@ -454,18 +497,20 @@ for my $file (@ARGV) {
         }
         close D;
     } else {
-        if (`file $file` =~ rrdFileMark) {
+#        print "$file\n";
+        if (`file '$file'` =~ rrdFileMark) {
             push (@files,$file);
         }
     }
 }
+
 
 my $searchDiapason;
 if (@dateDiapason == 2) {
     $searchDiapason = getSearchDiapason(\@dateDiapason,\@time);
 } else {
     if ($dateDiapason[0] =~ s/^~//) {
-        $STANDART_DIAPASON = 1;
+        $STANDART_DIAPASON = 0;
     }
     $searchDiapason = getSearchDiapason($dateDiapason[0],\@time);
 }
@@ -476,8 +521,12 @@ FILE: for my $file (@files) {
     } else {
         print "Process $file...\n";
     }
+
     my $xmlFile = "$file.xml";
-    my $bkpFile = ".$file.bkp";
+    my $bkpFile = "$file.bkp";
+
+    $bkpFile =~ s/\/([^\/]+)$/\/.$1/;
+
     if (system("rrdtool dump $file > $xmlFile")) {
         warn "$file: cannot convert to xml. Skip it.\n";
     } else {
